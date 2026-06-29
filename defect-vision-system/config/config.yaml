@@ -1,0 +1,28 @@
+project:
+  name: defect-vision-system
+  author: Youssef Lasheen
+  version: 1.0.0
+
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  image_size: 64
+  n_images_per_class: 1200
+  random_state: 42
+  classes:
+    - good
+    - defective
+
+model:
+  target_size: [64, 64]
+  batch_size: 32
+  epochs: 12
+  learning_rate: 0.001
+  saved_model_path: models/saved_models/defect_cnn.keras
+  class_names_path: models/artifacts/class_names.json
+  random_state: 42
+
+business:
+  cost_per_missed_defect: 85.0
+  cost_per_false_alarm: 6.0
+  units_inspected_per_day: 500
