@@ -1,14 +1,20 @@
 """
-Streamlit Dashboard — Defect Vision System
---------------------------------------------
+Streamlit Dashboard — Defect Vision System (Enterprise Edition)
+------------------------------------------------------------------
 Run with:
     streamlit run dashboard/app.py
 
-Lets a non-technical user upload a product-surface photo and see a live
-defect prediction plus a Grad-CAM heatmap explaining the decision.
+Enterprise-grade visual quality inspection console: single-image
+inspection, batch processing, video analysis, live KPIs, ROI modeling,
+ROC/PR diagnostics, session history, and exportable reports — all
+built on top of the existing CNN + Grad-CAM pipeline.
 """
+import base64
+import io
 import json
 import sys
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -24,11 +30,107 @@ sys.path.append(str(ROOT))
 from src.utils.config import load_config
 from src.models.gradcam import make_gradcam_heatmap, overlay_heatmap
 
-st.set_page_config(page_title="Defect Vision System", page_icon="🔍", layout="wide")
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
+try:
+    from sklearn.metrics import roc_curve, auc, precision_recall_curve
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
+st.set_page_config(page_title="Defect Vision System", layout="wide")
 
 config = load_config()
 
+# ---------------------------------------------------------------------------
+# ENTERPRISE THEME
+# ---------------------------------------------------------------------------
+ACCENT = "#3b82f6"
+GOOD_COLOR = "#16a34a"
+DEFECT_COLOR = "#dc2626"
+WARN_COLOR = "#d97706"
 
+st.markdown(
+    f"""
+    <style>
+    .stApp {{
+        background-color: #0b0f19;
+    }}
+    section[data-testid="stSidebar"] {{
+        background-color: #0f1420;
+        border-right: 1px solid #1f2937;
+    }}
+    .kpi-card {{
+        background: #111827;
+        border: 1px solid #1f2937;
+        border-radius: 10px;
+        padding: 18px 20px;
+        height: 100%;
+    }}
+    .kpi-label {{
+        color: #94a3b8;
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        margin-bottom: 6px;
+    }}
+    .kpi-value {{
+        color: #f1f5f9;
+        font-size: 1.9rem;
+        font-weight: 700;
+    }}
+    .kpi-sub {{
+        color: #64748b;
+        font-size: 0.8rem;
+        margin-top: 4px;
+    }}
+    .status-badge {{
+        border-radius: 8px;
+        padding: 16px 20px;
+        text-align: center;
+        border: 1px solid;
+    }}
+    .status-text {{
+        font-weight: 700;
+        font-size: 1.15rem;
+        letter-spacing: 0.06em;
+    }}
+    .alert-banner {{
+        background: rgba(217, 119, 6, 0.12);
+        border: 1px solid {WARN_COLOR};
+        color: #fbbf24;
+        border-radius: 8px;
+        padding: 12px 16px;
+        font-weight: 600;
+        margin-bottom: 14px;
+    }}
+    .brand-title {{
+        color: #f1f5f9;
+        font-size: 1.3rem;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+    }}
+    .brand-sub {{
+        color: #64748b;
+        font-size: 0.8rem;
+        margin-top: 2px;
+    }}
+    hr {{
+        border-color: #1f2937;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# CACHED LOADERS
+# ---------------------------------------------------------------------------
 @st.cache_resource
 def load_model_and_classes():
     model = keras.models.load_model(ROOT / config["model"]["saved_model_path"])
@@ -55,20 +157,271 @@ def load_classification_report():
     return None
 
 
+@st.cache_data
+def load_predictions():
+    """Optional file: reports/predictions.json with {"y_true": [...], "y_prob": [...]}
+    Needed for the ROC / Precision-Recall page. See note on that page for how
+    to generate it from evaluate_model.py."""
+    path = ROOT / "reports" / "predictions.json"
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return None
+
+
 model, class_names = load_model_and_classes()
 target_size = tuple(config["model"]["target_size"])
+DEFECT_IDX = class_names.index("defective") if "defective" in class_names else None
+GOOD_IDX = class_names.index("good") if "good" in class_names else None
 
-st.sidebar.title("🔍 Defect Vision")
-st.sidebar.caption("Built by Youssef Lasheen — AI & ML Engineer")
-page = st.sidebar.radio("Navigate", ["Live Inspector", "Model Performance", "Business Impact"])
+# ---------------------------------------------------------------------------
+# SESSION STATE
+# ---------------------------------------------------------------------------
+if "inspection_history" not in st.session_state:
+    st.session_state.inspection_history = []
+if "last_video_results" not in st.session_state:
+    st.session_state.last_video_results = None
+
+
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+def run_inference(img_pil: Image.Image, threshold: float = 0.5):
+    """Runs the model + Grad-CAM on a single PIL image and returns a result dict."""
+    img_resized = img_pil.resize(target_size)
+    arr = np.array(img_resized).astype("float32")
+    batch = arr[np.newaxis, ...]
+    probs = model.predict(batch, verbose=0)[0]
+
+    if DEFECT_IDX is not None:
+        defect_prob = float(probs[DEFECT_IDX])
+        if defect_prob >= threshold:
+            label = "defective"
+            confidence = defect_prob
+        else:
+            label = "good"
+            confidence = 1.0 - defect_prob
+        pred_idx = DEFECT_IDX if label == "defective" else GOOD_IDX
+    else:
+        pred_idx = int(np.argmax(probs))
+        label = class_names[pred_idx]
+        confidence = float(probs[pred_idx])
+
+    heatmap = make_gradcam_heatmap(batch, model, pred_index=pred_idx)
+    overlay = overlay_heatmap(heatmap, arr.astype("uint8"))
+
+    return {
+        "label": label,
+        "confidence": confidence,
+        "probs": probs,
+        "resized_image": img_resized,
+        "overlay": overlay,
+    }
+
+
+def log_inspection(source: str, label: str, confidence: float):
+    st.session_state.inspection_history.append(
+        {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source": source,
+            "label": label,
+            "confidence": round(confidence, 4),
+        }
+    )
+
+
+def status_badge(label: str, confidence: float, container=None):
+    target = container if container is not None else st
+    color = DEFECT_COLOR if label == "defective" else GOOD_COLOR
+    text = "DEFECTIVE" if label == "defective" else "GOOD"
+    target.markdown(
+        f"""
+        <div class="status-badge" style="background:{color}1a;border-color:{color};">
+            <span class="status-text" style="color:{color};">{text}</span>
+            <div style="color:#94a3b8;font-size:0.85rem;margin-top:4px;">
+                Confidence: {confidence:.1%}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def kpi_card(label: str, value: str, sub: str = "", container=None):
+    target = container if container is not None else st
+    target.markdown(
+        f"""
+        <div class="kpi-card">
+            <div class="kpi-label">{label}</div>
+            <div class="kpi-value">{value}</div>
+            <div class="kpi-sub">{sub}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def history_dataframe() -> pd.DataFrame:
+    if not st.session_state.inspection_history:
+        return pd.DataFrame(columns=["timestamp", "source", "label", "confidence"])
+    return pd.DataFrame(st.session_state.inspection_history)
+
+
+def build_html_report(defect_rate, avg_conf, total, report, biz) -> str:
+    rows_html = ""
+    if report:
+        for cls in class_names:
+            if cls in report:
+                r = report[cls]
+                rows_html += (
+                    f"<tr><td>{cls}</td><td>{r['precision']:.4f}</td>"
+                    f"<td>{r['recall']:.4f}</td><td>{r['f1-score']:.4f}</td>"
+                    f"<td>{r['support']}</td></tr>"
+                )
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    html = f"""
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <style>
+        body {{ font-family: Arial, sans-serif; background:#0b0f19; color:#e2e8f0; padding:32px; }}
+        h1 {{ color:#f1f5f9; }}
+        table {{ border-collapse: collapse; width:100%; margin-top:12px; }}
+        th, td {{ border:1px solid #1f2937; padding:8px 12px; text-align:left; }}
+        th {{ background:#111827; color:#94a3b8; text-transform:uppercase; font-size:0.75rem; }}
+        .metric {{ display:inline-block; background:#111827; border:1px solid #1f2937;
+                   border-radius:8px; padding:14px 18px; margin-right:12px; margin-bottom:12px; }}
+        .metric .label {{ color:#94a3b8; font-size:0.75rem; text-transform:uppercase; }}
+        .metric .value {{ color:#f1f5f9; font-size:1.4rem; font-weight:700; }}
+    </style>
+    </head>
+    <body>
+        <h1>Defect Vision System — Inspection Report</h1>
+        <p>Generated: {generated_at}</p>
+        <div>
+            <div class="metric"><div class="label">Session Inspections</div><div class="value">{total}</div></div>
+            <div class="metric"><div class="label">Defect Rate (session)</div><div class="value">{defect_rate:.1%}</div></div>
+            <div class="metric"><div class="label">Avg. Confidence</div><div class="value">{avg_conf:.1%}</div></div>
+        </div>
+        <h2>Model Test-Set Performance</h2>
+        <table>
+            <tr><th>Class</th><th>Precision</th><th>Recall</th><th>F1-score</th><th>Support</th></tr>
+            {rows_html if rows_html else "<tr><td colspan='5'>No classification report found.</td></tr>"}
+        </table>
+        <h2>Cost Assumptions</h2>
+        <table>
+            <tr><th>Parameter</th><th>Value</th></tr>
+            {''.join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in biz.items())}
+        </table>
+    </body>
+    </html>
+    """
+    return html
+
+
+# ---------------------------------------------------------------------------
+# SIDEBAR
+# ---------------------------------------------------------------------------
+st.sidebar.markdown(
+    """
+    <div class="brand-title">Defect Vision System</div>
+    <div class="brand-sub">Built by Youssef Lasheen — AI &amp; ML Engineer</div>
+    <hr>
+    """,
+    unsafe_allow_html=True,
+)
+
+page = st.sidebar.radio(
+    "Navigate",
+    [
+        "Overview",
+        "Live Inspector",
+        "Batch Processing",
+        "Video Analysis",
+        "Model Performance",
+        "ROC / PR Analysis",
+        "ROI Calculator",
+        "Inspection History",
+        "Business Impact",
+    ],
+)
+
+st.sidebar.markdown("<hr>", unsafe_allow_html=True)
+threshold = st.sidebar.slider(
+    "Decision threshold (defective class)", min_value=0.05, max_value=0.95, value=0.50, step=0.05
+)
+alert_threshold = st.sidebar.slider(
+    "Alert on defect rate above", min_value=0.05, max_value=0.90, value=0.20, step=0.05
+)
+st.sidebar.caption(
+    "Threshold controls apply to Live Inspector, Batch Processing and Video Analysis."
+)
+
+# ---------------------------------------------------------------------------
+# PAGE: Overview
+# ---------------------------------------------------------------------------
+if page == "Overview":
+    st.title("Operations Overview")
+    st.caption("Live session KPIs across all inspections run in this dashboard session.")
+
+    hist_df = history_dataframe()
+    total = len(hist_df)
+    defect_rate = (hist_df["label"] == "defective").mean() if total else 0.0
+    avg_conf = hist_df["confidence"].mean() if total else 0.0
+
+    if total and defect_rate > alert_threshold:
+        st.markdown(
+            f'<div class="alert-banner">ALERT — Session defect rate ({defect_rate:.1%}) '
+            f'exceeds the configured threshold ({alert_threshold:.1%}).</div>',
+            unsafe_allow_html=True,
+        )
+
+    c1, c2, c3, c4 = st.columns(4)
+    kpi_card("Total Inspections", f"{total}", "This session", c1)
+    kpi_card("Defect Rate", f"{defect_rate:.1%}", "Session average", c2)
+    kpi_card("Average Confidence", f"{avg_conf:.1%}" if total else "—", "All inspections", c3)
+    kpi_card(
+        "Status",
+        "ALERT" if (total and defect_rate > alert_threshold) else "NORMAL",
+        f"Threshold {alert_threshold:.0%}",
+        c4,
+    )
+
+    st.markdown("###")
+    col_a, col_b = st.columns([2, 1])
+    with col_a:
+        st.subheader("Recent Inspections")
+        if total:
+            st.dataframe(hist_df.tail(15).iloc[::-1], use_container_width=True, hide_index=True)
+        else:
+            st.info("No inspections logged yet. Use Live Inspector, Batch Processing or Video Analysis.")
+    with col_b:
+        st.subheader("Defect Rate Gauge")
+        gauge = go.Figure(
+            go.Indicator(
+                mode="gauge+number",
+                value=defect_rate * 100 if total else 0,
+                number={"suffix": "%"},
+                gauge={
+                    "axis": {"range": [0, 100]},
+                    "bar": {"color": ACCENT},
+                    "steps": [
+                        {"range": [0, alert_threshold * 100], "color": "#14532d"},
+                        {"range": [alert_threshold * 100, 100], "color": "#7f1d1d"},
+                    ],
+                },
+            )
+        )
+        gauge.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0")
+        st.plotly_chart(gauge, use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # PAGE: Live Inspector
 # ---------------------------------------------------------------------------
-if page == "Live Inspector":
-    st.title("Visual Quality Inspection System")
+elif page == "Live Inspector":
+    st.title("Live Inspector")
     st.caption(
-        "Upload a product-surface photo. The CNN classifies it as good/defective "
+        "Upload a product-surface photo. The CNN classifies it as good or defective "
         "and Grad-CAM highlights exactly which pixels drove the decision."
     )
 
@@ -94,41 +447,224 @@ if page == "Live Inspector":
             img = Image.open(sample_files[idx]).convert("RGB")
 
     if img is not None:
-        img_resized = img.resize(target_size)
-        arr = np.array(img_resized).astype("float32")
-        batch = arr[np.newaxis, ...]
-
-        probs = model.predict(batch, verbose=0)[0]
-        pred_idx = int(np.argmax(probs))
-        pred_label = class_names[pred_idx]
-        confidence = float(probs[pred_idx])
-
-        heatmap = make_gradcam_heatmap(batch, model, pred_index=pred_idx)
-        overlay = overlay_heatmap(heatmap, arr.astype("uint8"))
+        result = run_inference(img, threshold=threshold)
+        log_inspection("live_inspector", result["label"], result["confidence"])
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.image(img_resized, caption="Input image", use_container_width=True)
+            st.image(result["resized_image"], caption="Input image", use_container_width=True)
         with col2:
-            st.image(overlay, caption="Grad-CAM — what the model is looking at", use_container_width=True)
+            st.image(result["overlay"], caption="Grad-CAM — model attention", use_container_width=True)
         with col3:
-            if pred_label == "defective":
-                st.error(f"🔴 DEFECTIVE  ({confidence:.1%} confidence)")
-            else:
-                st.success(f"🟢 GOOD  ({confidence:.1%} confidence)")
-
+            status_badge(result["label"], result["confidence"])
             st.markdown("**Class probabilities**")
-            for cls, p in zip(class_names, probs):
+            for cls, p in zip(class_names, result["probs"]):
                 st.progress(float(p), text=f"{cls}: {p:.1%}")
-
     else:
         st.info("Upload an image above, or click one of the sample buttons to try the system.")
+
+# ---------------------------------------------------------------------------
+# PAGE: Batch Processing
+# ---------------------------------------------------------------------------
+elif page == "Batch Processing":
+    st.title("Batch Processing")
+    st.caption("Upload multiple images to run inspection across an entire batch at once.")
+
+    files = st.file_uploader(
+        "Upload images (PNG/JPG)", type=["png", "jpg", "jpeg"], accept_multiple_files=True
+    )
+
+    if files:
+        rows = []
+        thumbs = []
+        progress = st.progress(0.0, text="Processing batch...")
+        for i, f in enumerate(files):
+            img = Image.open(f).convert("RGB")
+            result = run_inference(img, threshold=threshold)
+            log_inspection(f"batch:{f.name}", result["label"], result["confidence"])
+            rows.append(
+                {
+                    "filename": f.name,
+                    "label": result["label"],
+                    "confidence": round(result["confidence"], 4),
+                }
+            )
+            thumbs.append((f.name, result["resized_image"], result["label"], result["confidence"]))
+            progress.progress((i + 1) / len(files), text=f"Processing batch... ({i + 1}/{len(files)})")
+        progress.empty()
+
+        batch_df = pd.DataFrame(rows)
+        defect_rate = (batch_df["label"] == "defective").mean()
+
+        if defect_rate > alert_threshold:
+            st.markdown(
+                f'<div class="alert-banner">ALERT — Batch defect rate ({defect_rate:.1%}) '
+                f'exceeds the configured threshold ({alert_threshold:.1%}).</div>',
+                unsafe_allow_html=True,
+            )
+
+        c1, c2, c3 = st.columns(3)
+        kpi_card("Batch Size", f"{len(files)}", "Images processed", c1)
+        kpi_card("Defect Rate", f"{defect_rate:.1%}", "This batch", c2)
+        kpi_card("Avg. Confidence", f"{batch_df['confidence'].mean():.1%}", "This batch", c3)
+
+        st.subheader("Results")
+        st.dataframe(batch_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download results (CSV)",
+            batch_df.to_csv(index=False).encode("utf-8"),
+            file_name="batch_results.csv",
+            mime="text/csv",
+        )
+
+        st.subheader("Thumbnails")
+        grid_cols = st.columns(4)
+        for i, (name, thumb, label, conf) in enumerate(thumbs):
+            with grid_cols[i % 4]:
+                st.image(thumb, use_container_width=True)
+                color = DEFECT_COLOR if label == "defective" else GOOD_COLOR
+                st.markdown(
+                    f'<div style="text-align:center;color:{color};font-weight:600;">'
+                    f'{label.upper()} ({conf:.0%})</div><div style="text-align:center;'
+                    f'color:#64748b;font-size:0.75rem;">{name}</div>',
+                    unsafe_allow_html=True,
+                )
+    else:
+        st.info("Upload two or more images to run a batch inspection.")
+
+# ---------------------------------------------------------------------------
+# PAGE: Video Analysis
+# ---------------------------------------------------------------------------
+elif page == "Video Analysis":
+    st.title("Video Analysis")
+    st.caption(
+        "Upload a video of the production line. Frames are sampled at a fixed interval, "
+        "each frame is run through the model, and results are plotted as a timeline."
+    )
+
+    if not CV2_AVAILABLE:
+        st.warning(
+            "This feature requires OpenCV, which is not installed in the current "
+            "environment. Add `opencv-python-headless` to requirements.txt and redeploy "
+            "to enable video analysis. Every other page on this dashboard works without it."
+        )
+    else:
+        video_file = st.file_uploader("Upload a video (MP4/AVI/MOV)", type=["mp4", "avi", "mov", "mkv"])
+        col_a, col_b = st.columns(2)
+        with col_a:
+            sample_interval = st.slider("Sample every N seconds", 0.5, 5.0, 1.0, 0.5)
+        with col_b:
+            max_frames = st.slider("Max frames to analyze", 10, 150, 60, 10)
+
+        if video_file is not None and st.button("Run video analysis", use_container_width=True):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(video_file.name).suffix) as tmp:
+                tmp.write(video_file.read())
+                tmp_path = tmp.name
+
+            cap = cv2.VideoCapture(tmp_path)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            frame_interval = max(int(fps * sample_interval), 1)
+
+            rows = []
+            flagged_frames = []
+            frame_idx = 0
+            analyzed = 0
+            progress = st.progress(0.0, text="Analyzing video...")
+
+            while cap.isOpened() and analyzed < max_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if frame_idx % frame_interval == 0:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pil_frame = Image.fromarray(rgb)
+                    result = run_inference(pil_frame, threshold=threshold)
+                    timestamp_sec = frame_idx / fps
+                    rows.append(
+                        {
+                            "timestamp_sec": round(timestamp_sec, 2),
+                            "label": result["label"],
+                            "confidence": round(result["confidence"], 4),
+                        }
+                    )
+                    if result["label"] == "defective":
+                        flagged_frames.append((timestamp_sec, result["resized_image"], result["confidence"]))
+                    log_inspection(f"video:{video_file.name}@{timestamp_sec:.1f}s", result["label"], result["confidence"])
+                    analyzed += 1
+                    progress.progress(min(analyzed / max_frames, 1.0), text=f"Analyzing video... ({analyzed}/{max_frames} frames)")
+                frame_idx += 1
+
+            cap.release()
+            progress.empty()
+
+            if not rows:
+                st.error("No frames could be extracted from this video.")
+            else:
+                video_df = pd.DataFrame(rows)
+                st.session_state.last_video_results = video_df
+                defect_rate = (video_df["label"] == "defective").mean()
+
+                if defect_rate > alert_threshold:
+                    st.markdown(
+                        f'<div class="alert-banner">ALERT — {len(flagged_frames)} defective frame(s) '
+                        f'detected ({defect_rate:.1%} of analyzed frames).</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                c1, c2, c3 = st.columns(3)
+                kpi_card("Frames Analyzed", f"{len(video_df)}", f"Every {sample_interval}s", c1)
+                kpi_card("Defect Rate", f"{defect_rate:.1%}", "Across sampled frames", c2)
+                kpi_card("Flagged Frames", f"{len(flagged_frames)}", "Defective detections", c3)
+
+                st.subheader("Defect Timeline")
+                timeline = go.Figure()
+                colors = [DEFECT_COLOR if l == "defective" else GOOD_COLOR for l in video_df["label"]]
+                timeline.add_trace(
+                    go.Scatter(
+                        x=video_df["timestamp_sec"],
+                        y=video_df["confidence"],
+                        mode="markers+lines",
+                        marker=dict(color=colors, size=9),
+                        line=dict(color="#334155"),
+                        name="Confidence",
+                    )
+                )
+                timeline.update_layout(
+                    xaxis_title="Time (seconds)",
+                    yaxis_title="Confidence",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font_color="#e2e8f0",
+                )
+                st.plotly_chart(timeline, use_container_width=True)
+
+                if flagged_frames:
+                    st.subheader("Flagged Frames")
+                    grid_cols = st.columns(4)
+                    for i, (ts, thumb, conf) in enumerate(flagged_frames[:12]):
+                        with grid_cols[i % 4]:
+                            st.image(thumb, use_container_width=True)
+                            st.markdown(
+                                f'<div style="text-align:center;color:{DEFECT_COLOR};font-size:0.8rem;">'
+                                f't = {ts:.1f}s ({conf:.0%})</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                st.download_button(
+                    "Download frame-level results (CSV)",
+                    video_df.to_csv(index=False).encode("utf-8"),
+                    file_name="video_analysis_results.csv",
+                    mime="text/csv",
+                )
+        elif st.session_state.last_video_results is not None:
+            st.info("Showing results from the last run. Upload a new video and click Run to re-analyze.")
+            st.dataframe(st.session_state.last_video_results, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------------------------
 # PAGE: Model Performance
 # ---------------------------------------------------------------------------
 elif page == "Model Performance":
-    st.title("📈 Model Performance")
+    st.title("Model Performance")
 
     history = load_training_history()
     report = load_classification_report()
@@ -139,28 +675,36 @@ elif page == "Model Performance":
             fig = go.Figure()
             fig.add_trace(go.Scatter(y=history["accuracy"], name="Train accuracy"))
             fig.add_trace(go.Scatter(y=history["val_accuracy"], name="Val accuracy"))
-            fig.update_layout(title="Accuracy over training", xaxis_title="Epoch", yaxis_title="Accuracy")
+            fig.update_layout(
+                title="Accuracy over training", xaxis_title="Epoch", yaxis_title="Accuracy",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+            )
             st.plotly_chart(fig, use_container_width=True)
         with col2:
             fig = go.Figure()
             fig.add_trace(go.Scatter(y=history["loss"], name="Train loss"))
             fig.add_trace(go.Scatter(y=history["val_loss"], name="Val loss"))
-            fig.update_layout(title="Loss over training", xaxis_title="Epoch", yaxis_title="Loss")
+            fig.update_layout(
+                title="Loss over training", xaxis_title="Epoch", yaxis_title="Loss",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     if report:
-        st.subheader("Classification report (test set)")
+        st.subheader("Classification Report (Test Set)")
         rows = []
         for cls in class_names:
             if cls in report:
-                rows.append({
-                    "class": cls,
-                    "precision": report[cls]["precision"],
-                    "recall": report[cls]["recall"],
-                    "f1-score": report[cls]["f1-score"],
-                    "support": report[cls]["support"],
-                })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                rows.append(
+                    {
+                        "class": cls,
+                        "precision": report[cls]["precision"],
+                        "recall": report[cls]["recall"],
+                        "f1-score": report[cls]["f1-score"],
+                        "support": report[cls]["support"],
+                    }
+                )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         st.metric("Overall test accuracy", f"{report['accuracy']:.2%}")
 
     figures_dir = ROOT / "reports" / "figures"
@@ -175,10 +719,177 @@ elif page == "Model Performance":
             st.image(str(gradcam_path), caption="Grad-CAM samples", use_container_width=True)
 
 # ---------------------------------------------------------------------------
+# PAGE: ROC / PR Analysis
+# ---------------------------------------------------------------------------
+elif page == "ROC / PR Analysis":
+    st.title("ROC / Precision-Recall Analysis")
+
+    if not SKLEARN_AVAILABLE:
+        st.warning("This page requires scikit-learn. Add `scikit-learn` to requirements.txt and redeploy.")
+    else:
+        preds = load_predictions()
+        if not preds or "y_true" not in preds or "y_prob" not in preds:
+            st.info(
+                "No `reports/predictions.json` file found. ROC and Precision-Recall curves "
+                "need the raw per-sample probabilities from the test set, which the current "
+                "evaluate_model.py does not export. Add the following before it writes "
+                "classification_report.json, using the defective class as the positive class:"
+            )
+            st.code(
+                "import json\n"
+                "y_prob_defective = probs[:, class_names.index('defective')].tolist()\n"
+                "y_true_defective = (y_test == class_names.index('defective')).astype(int).tolist()\n"
+                "with open(ROOT / 'reports' / 'predictions.json', 'w') as f:\n"
+                "    json.dump({'y_true': y_true_defective, 'y_prob': y_prob_defective}, f)\n",
+                language="python",
+            )
+        else:
+            y_true = np.array(preds["y_true"])
+            y_prob = np.array(preds["y_prob"])
+
+            fpr, tpr, _ = roc_curve(y_true, y_prob)
+            roc_auc = auc(fpr, tpr)
+            precision, recall, _ = precision_recall_curve(y_true, y_prob)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=fpr, y=tpr, name=f"ROC (AUC = {roc_auc:.3f})", line=dict(color=ACCENT)))
+                fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], name="Random baseline", line=dict(dash="dash", color="#475569")))
+                fig.update_layout(
+                    title="ROC Curve", xaxis_title="False Positive Rate", yaxis_title="True Positive Rate",
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            with col2:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=recall, y=precision, name="Precision-Recall", line=dict(color=ACCENT)))
+                fig.update_layout(
+                    title="Precision-Recall Curve", xaxis_title="Recall", yaxis_title="Precision",
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.metric("ROC AUC", f"{roc_auc:.4f}")
+
+# ---------------------------------------------------------------------------
+# PAGE: ROI Calculator
+# ---------------------------------------------------------------------------
+elif page == "ROI Calculator":
+    st.title("ROI Calculator")
+    st.caption("Model estimates prefill from the test-set classification report where available.")
+
+    report = load_classification_report()
+    biz = config["business"]
+
+    default_recall = report["defective"]["recall"] if report and "defective" in report else 0.95
+    default_defect_rate = 0.10
+    if report and "defective" in report and "good" in report:
+        d_support = report["defective"]["support"]
+        g_support = report["good"]["support"]
+        if d_support + g_support > 0:
+            default_defect_rate = d_support / (d_support + g_support)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Volume & Defect Rate")
+        daily_volume = st.number_input("Units inspected per day", min_value=1, value=int(biz.get("units_inspected_per_day", 500)))
+        defect_rate_input = st.slider("Historical defect rate", 0.0, 1.0, float(round(default_defect_rate, 2)))
+        model_recall = st.slider("Model recall (defect detection rate)", 0.0, 1.0, float(round(default_recall, 2)))
+        model_false_alarm_rate = st.slider("Model false-alarm rate on good units", 0.0, 1.0, 0.0)
+    with col2:
+        st.subheader("Cost Assumptions")
+        cost_missed = st.number_input("Cost per missed defect ($)", min_value=0.0, value=float(biz.get("cost_per_missed_defect", 85)))
+        cost_false_alarm = st.number_input("Cost per false alarm ($)", min_value=0.0, value=float(biz.get("cost_per_false_alarm", 6)))
+        manual_recall = st.slider("Manual inspection recall (baseline)", 0.0, 1.0, 1.0)
+        manual_false_alarm_rate = st.slider("Manual inspection false-alarm rate (baseline)", 0.0, 1.0, 0.0)
+
+    daily_defects = daily_volume * defect_rate_input
+    daily_good = daily_volume - daily_defects
+
+    model_missed = daily_defects * (1 - model_recall)
+    model_false_alarms = daily_good * model_false_alarm_rate
+    model_daily_cost = model_missed * cost_missed + model_false_alarms * cost_false_alarm
+
+    manual_missed = daily_defects * (1 - manual_recall)
+    manual_false_alarms = daily_good * manual_false_alarm_rate
+    manual_daily_cost = manual_missed * cost_missed + manual_false_alarms * cost_false_alarm
+
+    daily_savings = manual_daily_cost - model_daily_cost
+
+    st.markdown("###")
+    c1, c2, c3 = st.columns(3)
+    kpi_card("Daily Savings", f"${daily_savings:,.2f}", "Model vs. manual baseline", c1)
+    kpi_card("Monthly Savings", f"${daily_savings * 30:,.2f}", "30-day estimate", c2)
+    kpi_card("Annual Savings", f"${daily_savings * 365:,.2f}", "365-day estimate", c3)
+
+    st.subheader("Cost Comparison")
+    fig = go.Figure(
+        data=[
+            go.Bar(name="Manual Inspection", x=["Daily Cost"], y=[manual_daily_cost], marker_color="#64748b"),
+            go.Bar(name="Model-Assisted", x=["Daily Cost"], y=[model_daily_cost], marker_color=ACCENT),
+        ]
+    )
+    fig.update_layout(
+        barmode="group", yaxis_title="Estimated cost ($)",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        "Costs are estimated from missed defects and false alarms only, at the volume and "
+        "rates configured above. They do not include labor, throughput, or downtime effects."
+    )
+
+# ---------------------------------------------------------------------------
+# PAGE: Inspection History
+# ---------------------------------------------------------------------------
+elif page == "Inspection History":
+    st.title("Inspection History")
+    st.caption("All inspections run in this browser session (Live Inspector, Batch Processing, Video Analysis).")
+
+    hist_df = history_dataframe()
+
+    if hist_df.empty:
+        st.info("No inspections logged yet in this session.")
+    else:
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            label_filter = st.selectbox("Filter by label", ["All", "defective", "good"])
+        filtered = hist_df if label_filter == "All" else hist_df[hist_df["label"] == label_filter]
+
+        st.dataframe(filtered.iloc[::-1], use_container_width=True, hide_index=True)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.download_button(
+                "Download history (CSV)",
+                hist_df.to_csv(index=False).encode("utf-8"),
+                file_name="inspection_history.csv",
+                mime="text/csv",
+            )
+        with col_b:
+            if st.button("Clear history", use_container_width=True):
+                st.session_state.inspection_history = []
+                st.rerun()
+
+        if len(hist_df) >= 3:
+            st.subheader("Defect Rate Trend")
+            hist_df["is_defective"] = (hist_df["label"] == "defective").astype(int)
+            hist_df["rolling_rate"] = hist_df["is_defective"].expanding().mean()
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(y=hist_df["rolling_rate"], mode="lines", line=dict(color=ACCENT)))
+            fig.update_layout(
+                xaxis_title="Inspection #", yaxis_title="Cumulative defect rate",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+# ---------------------------------------------------------------------------
 # PAGE: Business Impact
 # ---------------------------------------------------------------------------
 elif page == "Business Impact":
-    st.title("💰 Business Impact")
+    st.title("Business Impact")
 
     summary_path = ROOT / "reports" / "summary.md"
     if summary_path.exists():
@@ -187,5 +898,21 @@ elif page == "Business Impact":
         st.info("Run `python src/models/evaluate_model.py` first to generate the business summary.")
 
     biz = config["business"]
-    st.subheader("Cost assumptions")
+    st.subheader("Cost Assumptions")
     st.json(biz)
+
+    st.subheader("Export Report")
+    hist_df = history_dataframe()
+    total = len(hist_df)
+    defect_rate = (hist_df["label"] == "defective").mean() if total else 0.0
+    avg_conf = hist_df["confidence"].mean() if total else 0.0
+    report = load_classification_report()
+
+    html_report = build_html_report(defect_rate, avg_conf, total, report, biz)
+    st.download_button(
+        "Download HTML report",
+        html_report.encode("utf-8"),
+        file_name=f"defect_vision_report_{datetime.now().strftime('%Y%m%d_%H%M')}.html",
+        mime="text/html",
+    )
+    st.caption("The report includes session KPIs, the test-set classification report, and cost assumptions.")
