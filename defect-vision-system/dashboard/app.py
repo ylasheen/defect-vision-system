@@ -14,6 +14,7 @@ same red / amber / green signal colors used on a factory status
 tower, paired with a monospace readout face for every number.
 """
 import json
+import re
 import sys
 import tempfile
 from datetime import datetime
@@ -48,6 +49,22 @@ st.set_page_config(page_title="Defect Vision System", layout="wide")
 
 config = load_config()
 
+
+def raw_html(markup: str, target=None):
+    """st.markdown(..., unsafe_allow_html=True) helper.
+
+    Streamlit's markdown parser treats any line indented 4+ spaces as a
+    literal code block, which is trivially true for HTML/CSS written with
+    normal Python indentation. That makes the block render as visible text
+    instead of being applied. Stripping leading whitespace from every line
+    (safe for CSS/HTML, since neither is whitespace-sensitive there) avoids
+    the false-positive code-block detection. `target` lets this be used on
+    a column/container object (e.g. st.columns()[0]) as well as `st` itself.
+    """
+    (target if target is not None else st).markdown(
+        re.sub(r"(?m)^[ \t]+", "", markup), unsafe_allow_html=True
+    )
+
 # ---------------------------------------------------------------------------
 # DESIGN TOKENS
 # ---------------------------------------------------------------------------
@@ -69,7 +86,7 @@ FONT_MONO = "'IBM Plex Mono', 'SFMono-Regular', monospace"
 # ---------------------------------------------------------------------------
 # GLOBAL STYLE
 # ---------------------------------------------------------------------------
-st.markdown(
+raw_html(
     f"""
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -327,8 +344,7 @@ st.markdown(
         gap: 4px;
     }}
     </style>
-    """,
-    unsafe_allow_html=True,
+    """
 )
 
 
@@ -435,10 +451,9 @@ def log_inspection(source: str, label: str, confidence: float):
 
 
 def status_badge(label: str, confidence: float, container=None):
-    target = container if container is not None else st
     color = DEFECT_COLOR if label == "defective" else GOOD_COLOR
     text = "DEFECTIVE" if label == "defective" else "GOOD"
-    target.markdown(
+    raw_html(
         f"""
         <div class="status-badge" style="border-color:{color}55;">
             <span class="status-led" style="background:{color};box-shadow:0 0 10px {color};"></span>
@@ -448,14 +463,13 @@ def status_badge(label: str, confidence: float, container=None):
             </div>
         </div>
         """,
-        unsafe_allow_html=True,
+        target=container,
     )
 
 
 def kpi_card(label: str, value: str, sub: str = "", container=None, accent: str = None):
-    target = container if container is not None else st
     border_color = accent if accent else ACCENT
-    target.markdown(
+    raw_html(
         f"""
         <div class="kpi-card" style="border-left-color:{border_color};">
             <div class="kpi-label">{label}</div>
@@ -463,20 +477,19 @@ def kpi_card(label: str, value: str, sub: str = "", container=None, accent: str 
             <div class="kpi-sub">{sub}</div>
         </div>
         """,
-        unsafe_allow_html=True,
+        target=container,
     )
 
 
 def page_header(eyebrow: str, title: str, subtitle: str = ""):
-    st.markdown(
+    raw_html(
         f"""
         <div class="page-header">
             <div class="page-eyebrow"><span class="dot"></span>{eyebrow}</div>
             <div class="page-title">{title}</div>
             {f'<div class="page-subtitle">{subtitle}</div>' if subtitle else ""}
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -555,7 +568,7 @@ def build_html_report(defect_rate, avg_conf, total, report, biz) -> str:
 # ---------------------------------------------------------------------------
 # SIDEBAR
 # ---------------------------------------------------------------------------
-st.sidebar.markdown(
+raw_html(
     f"""
     <div class="brand-row">
         <div class="brand-mark"></div>
@@ -566,7 +579,7 @@ st.sidebar.markdown(
     </div>
     <div class="sidebar-eyebrow">Modules</div>
     """,
-    unsafe_allow_html=True,
+    target=st.sidebar,
 )
 
 page = st.sidebar.radio(
@@ -612,7 +625,7 @@ def render_status_strip():
         else:
             status, color = "NOMINAL", GOOD_COLOR
             msg = f"Defect rate {defect_rate:.1%} — within threshold ({total} inspections logged)"
-    st.markdown(
+    raw_html(
         f"""
         <div class="status-strip" style="border-color:{color}55;">
             <span class="status-strip-led" style="background:{color};box-shadow:0 0 8px {color};"></span>
@@ -620,8 +633,7 @@ def render_status_strip():
             <span class="status-strip-msg">{msg}</span>
             <span class="status-strip-time">{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</span>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
