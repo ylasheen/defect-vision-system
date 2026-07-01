@@ -7,3 +7,4 @@ matplotlib
 pyyaml
 pandas
 joblib
+opencv-python-headless
