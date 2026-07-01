@@ -140,6 +140,14 @@ def main():
 
     # ---- Reports --------------------------------------------------------------------
     reports_dir = ROOT / "reports"
+
+    # Raw per-sample probabilities for the defective class, needed by the
+    # dashboard's ROC / Precision-Recall Analysis page.
+    y_prob_defective = probs[:, defective_idx].tolist()
+    y_true_defective = (y_test == defective_idx).astype(int).tolist()
+    with open(reports_dir / "predictions.json", "w") as f:
+        json.dump({"y_true": y_true_defective, "y_prob": y_prob_defective}, f)
+
     with open(reports_dir / "classification_report.json", "w") as f:
         json.dump(report, f, indent=2)
 
