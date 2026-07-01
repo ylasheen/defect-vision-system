@@ -8,13 +8,10 @@ Enterprise-grade visual quality inspection console: single-image
 inspection, batch processing, video analysis, live KPIs, ROI modeling,
 ROC/PR diagnostics, session history, and exportable reports — all
 built on top of the existing CNN + Grad-CAM pipeline.
-
-Visual identity: instrumentation / andon-light control panel — the
-same red / amber / green signal colors used on a factory status
-tower, paired with a monospace readout face for every number.
 """
+import base64
+import io
 import json
-import re
 import sys
 import tempfile
 from datetime import datetime
@@ -49,302 +46,85 @@ st.set_page_config(page_title="Defect Vision System", layout="wide")
 
 config = load_config()
 
-
-def raw_html(markup: str, target=None):
-    """st.markdown(..., unsafe_allow_html=True) helper.
-
-    Streamlit's markdown parser treats any line indented 4+ spaces as a
-    literal code block, which is trivially true for HTML/CSS written with
-    normal Python indentation. That makes the block render as visible text
-    instead of being applied. Stripping leading whitespace from every line
-    (safe for CSS/HTML, since neither is whitespace-sensitive there) avoids
-    the false-positive code-block detection. `target` lets this be used on
-    a column/container object (e.g. st.columns()[0]) as well as `st` itself.
-    """
-    (target if target is not None else st).markdown(
-        re.sub(r"(?m)^[ \t]+", "", markup), unsafe_allow_html=True
-    )
-
 # ---------------------------------------------------------------------------
-# DESIGN TOKENS
+# ENTERPRISE THEME
 # ---------------------------------------------------------------------------
-BG = "#0a0e14"
-PANEL = "#121821"
-PANEL_ALT = "#161d28"
-BORDER = "#232b38"
-TEXT_PRIMARY = "#e8ebf1"
-TEXT_SECONDARY = "#8891a1"
+ACCENT = "#3b82f6"
+GOOD_COLOR = "#16a34a"
+DEFECT_COLOR = "#dc2626"
+WARN_COLOR = "#d97706"
 
-ACCENT = "#4f8cff"        # interactive / data accent — charts, links, focus
-GOOD_COLOR = "#22c55e"    # andon green  — pass
-WARN_COLOR = "#f59e0b"    # andon amber  — caution / alert
-DEFECT_COLOR = "#ef4444"  # andon red    — fail
-
-FONT_SANS = "'Inter', -apple-system, sans-serif"
-FONT_MONO = "'IBM Plex Mono', 'SFMono-Regular', monospace"
-
-# ---------------------------------------------------------------------------
-# GLOBAL STYLE
-# ---------------------------------------------------------------------------
-raw_html(
+st.markdown(
     f"""
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
-    html, body, [class*="css"] {{
-        font-family: {FONT_SANS};
-    }}
-
     .stApp {{
-        background-color: {BG};
-        background-image:
-            linear-gradient(rgba(79, 140, 255, 0.045) 1px, transparent 1px),
-            linear-gradient(90deg, rgba(79, 140, 255, 0.045) 1px, transparent 1px);
-        background-size: 34px 34px;
+        background-color: #0b0f19;
     }}
-
     section[data-testid="stSidebar"] {{
-        background-color: {PANEL};
-        border-right: 1px solid {BORDER};
+        background-color: #0f1420;
+        border-right: 1px solid #1f2937;
     }}
-    section[data-testid="stSidebar"] * {{
-        font-family: {FONT_SANS};
-    }}
-
-    /* ---- Brand block ---- */
-    .brand-row {{
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        margin-bottom: 4px;
-    }}
-    .brand-mark {{
-        width: 34px;
-        height: 34px;
-        border-radius: 50%;
-        border: 2px solid {ACCENT};
-        position: relative;
-        flex-shrink: 0;
-    }}
-    .brand-mark::after {{
-        content: "";
-        position: absolute;
-        top: 50%;
-        left: 50%;
-        width: 9px;
-        height: 9px;
-        background: {ACCENT};
-        border-radius: 50%;
-        transform: translate(-50%, -50%);
-    }}
-    .brand-title {{
-        color: {TEXT_PRIMARY};
-        font-size: 1.05rem;
-        font-weight: 700;
-        letter-spacing: 0.01em;
-        line-height: 1.2;
-    }}
-    .brand-sub {{
-        color: {TEXT_SECONDARY};
-        font-size: 0.74rem;
-        margin-top: 1px;
-    }}
-    .sidebar-eyebrow {{
-        font-family: {FONT_MONO};
-        color: {TEXT_SECONDARY};
-        font-size: 0.68rem;
-        letter-spacing: 0.14em;
-        text-transform: uppercase;
-        margin: 18px 0 6px 0;
-    }}
-
-    /* ---- Page header ---- */
-    .page-header {{
-        border-bottom: 1px solid {BORDER};
-        padding-bottom: 14px;
-        margin-bottom: 22px;
-    }}
-    .page-eyebrow {{
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        font-family: {FONT_MONO};
-        font-size: 0.72rem;
-        letter-spacing: 0.16em;
-        text-transform: uppercase;
-        color: {ACCENT};
-        margin-bottom: 8px;
-    }}
-    .page-eyebrow .dot {{
-        width: 6px;
-        height: 6px;
-        background: {ACCENT};
-    }}
-    .page-title {{
-        color: {TEXT_PRIMARY};
-        font-size: 1.7rem;
-        font-weight: 700;
-        letter-spacing: -0.01em;
-    }}
-    .page-subtitle {{
-        color: {TEXT_SECONDARY};
-        font-size: 0.9rem;
-        margin-top: 6px;
-        max-width: 780px;
-        line-height: 1.5;
-    }}
-
-    /* ---- Status strip (system health) ---- */
-    .status-strip {{
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        background: {PANEL};
-        border: 1px solid {BORDER};
-        border-radius: 8px;
-        padding: 10px 16px;
-        margin-bottom: 24px;
-        font-family: {FONT_MONO};
-    }}
-    .status-strip-led {{
-        width: 9px;
-        height: 9px;
-        border-radius: 50%;
-        flex-shrink: 0;
-    }}
-    .status-strip-label {{
-        font-weight: 700;
-        font-size: 0.75rem;
-        letter-spacing: 0.1em;
-    }}
-    .status-strip-msg {{
-        color: {TEXT_SECONDARY};
-        font-size: 0.78rem;
-        flex-grow: 1;
-    }}
-    .status-strip-time {{
-        color: {TEXT_SECONDARY};
-        opacity: 0.55;
-        font-size: 0.7rem;
-    }}
-
-    /* ---- KPI cards ---- */
     .kpi-card {{
-        background: {PANEL};
-        border: 1px solid {BORDER};
-        border-left: 3px solid {ACCENT};
-        border-radius: 6px;
-        padding: 16px 18px;
+        background: #111827;
+        border: 1px solid #1f2937;
+        border-radius: 10px;
+        padding: 18px 20px;
         height: 100%;
     }}
     .kpi-label {{
-        color: {TEXT_SECONDARY};
-        font-family: {FONT_MONO};
-        font-size: 0.68rem;
+        color: #94a3b8;
+        font-size: 0.78rem;
         text-transform: uppercase;
-        letter-spacing: 0.1em;
-        margin-bottom: 8px;
+        letter-spacing: 0.06em;
+        margin-bottom: 6px;
     }}
     .kpi-value {{
-        color: {TEXT_PRIMARY};
-        font-family: {FONT_MONO};
-        font-size: 1.75rem;
-        font-weight: 600;
-        font-variant-numeric: tabular-nums;
+        color: #f1f5f9;
+        font-size: 1.9rem;
+        font-weight: 700;
     }}
     .kpi-sub {{
-        color: {TEXT_SECONDARY};
-        font-size: 0.76rem;
-        margin-top: 5px;
+        color: #64748b;
+        font-size: 0.8rem;
+        margin-top: 4px;
     }}
-
-    /* ---- Status badge (LED readout) ---- */
     .status-badge {{
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        background: {PANEL};
-        border: 1px solid {BORDER};
         border-radius: 8px;
-        padding: 16px 18px;
-    }}
-    .status-led {{
-        width: 13px;
-        height: 13px;
-        border-radius: 50%;
-        flex-shrink: 0;
+        padding: 16px 20px;
+        text-align: center;
+        border: 1px solid;
     }}
     .status-text {{
-        font-family: {FONT_MONO};
         font-weight: 700;
-        font-size: 1.05rem;
+        font-size: 1.15rem;
         letter-spacing: 0.06em;
-        line-height: 1.2;
     }}
-    .status-confidence {{
-        font-family: {FONT_MONO};
-        color: {TEXT_SECONDARY};
-        font-size: 0.72rem;
-        letter-spacing: 0.04em;
-        margin-top: 3px;
-    }}
-
     .alert-banner {{
-        background: rgba(245, 158, 11, 0.10);
+        background: rgba(217, 119, 6, 0.12);
         border: 1px solid {WARN_COLOR};
-        color: #fcd34d;
+        color: #fbbf24;
         border-radius: 8px;
         padding: 12px 16px;
-        font-family: {FONT_MONO};
-        font-size: 0.82rem;
         font-weight: 600;
-        margin-bottom: 16px;
+        margin-bottom: 14px;
     }}
-
-    hr {{ border-color: {BORDER}; }}
-
-    /* ---- Widget polish ---- */
-    div[data-testid="stMetricValue"] {{
-        font-family: {FONT_MONO};
-        color: {TEXT_PRIMARY};
+    .brand-title {{
+        color: #f1f5f9;
+        font-size: 1.3rem;
+        font-weight: 700;
+        letter-spacing: 0.02em;
     }}
-    div[data-testid="stMetricLabel"] {{
-        font-family: {FONT_MONO};
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        font-size: 0.7rem;
+    .brand-sub {{
+        color: #64748b;
+        font-size: 0.8rem;
+        margin-top: 2px;
     }}
-    div[data-testid="stFileUploader"] section {{
-        background: {PANEL_ALT};
-        border: 1px dashed {BORDER};
-        border-radius: 8px;
-    }}
-    div[data-testid="stDataFrame"] {{
-        border: 1px solid {BORDER};
-        border-radius: 8px;
-        overflow: hidden;
-    }}
-    div[data-testid="stAlert"] {{
-        border-radius: 8px;
-        font-size: 0.88rem;
-    }}
-    .stButton > button, .stDownloadButton > button {{
-        font-family: {FONT_SANS};
-        background: {PANEL_ALT};
-        color: {TEXT_PRIMARY};
-        border: 1px solid {BORDER};
-        border-radius: 6px;
-        font-weight: 500;
-    }}
-    .stButton > button:hover, .stDownloadButton > button:hover {{
-        border-color: {ACCENT};
-        color: {ACCENT};
-    }}
-    .stTabs [data-baseweb="tab-list"] {{
-        gap: 4px;
+    hr {{
+        border-color: #1f2937;
     }}
     </style>
-    """
+    """,
+    unsafe_allow_html=True,
 )
 
 
@@ -451,45 +231,33 @@ def log_inspection(source: str, label: str, confidence: float):
 
 
 def status_badge(label: str, confidence: float, container=None):
+    target = container if container is not None else st
     color = DEFECT_COLOR if label == "defective" else GOOD_COLOR
     text = "DEFECTIVE" if label == "defective" else "GOOD"
-    raw_html(
+    target.markdown(
         f"""
-        <div class="status-badge" style="border-color:{color}55;">
-            <span class="status-led" style="background:{color};box-shadow:0 0 10px {color};"></span>
-            <div>
-                <div class="status-text" style="color:{color};">{text}</div>
-                <div class="status-confidence">CONFIDENCE&nbsp;{confidence:.1%}</div>
+        <div class="status-badge" style="background:{color}1a;border-color:{color};">
+            <span class="status-text" style="color:{color};">{text}</span>
+            <div style="color:#94a3b8;font-size:0.85rem;margin-top:4px;">
+                Confidence: {confidence:.1%}
             </div>
         </div>
         """,
-        target=container,
+        unsafe_allow_html=True,
     )
 
 
-def kpi_card(label: str, value: str, sub: str = "", container=None, accent: str = None):
-    border_color = accent if accent else ACCENT
-    raw_html(
+def kpi_card(label: str, value: str, sub: str = "", container=None):
+    target = container if container is not None else st
+    target.markdown(
         f"""
-        <div class="kpi-card" style="border-left-color:{border_color};">
+        <div class="kpi-card">
             <div class="kpi-label">{label}</div>
             <div class="kpi-value">{value}</div>
             <div class="kpi-sub">{sub}</div>
         </div>
         """,
-        target=container,
-    )
-
-
-def page_header(eyebrow: str, title: str, subtitle: str = ""):
-    raw_html(
-        f"""
-        <div class="page-header">
-            <div class="page-eyebrow"><span class="dot"></span>{eyebrow}</div>
-            <div class="page-title">{title}</div>
-            {f'<div class="page-subtitle">{subtitle}</div>' if subtitle else ""}
-        </div>
-        """
+        unsafe_allow_html=True,
     )
 
 
@@ -497,18 +265,6 @@ def history_dataframe() -> pd.DataFrame:
     if not st.session_state.inspection_history:
         return pd.DataFrame(columns=["timestamp", "source", "label", "confidence"])
     return pd.DataFrame(st.session_state.inspection_history)
-
-
-def apply_chart_theme(fig):
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family=FONT_SANS, color=TEXT_PRIMARY),
-        legend=dict(bgcolor="rgba(0,0,0,0)"),
-    )
-    fig.update_xaxes(gridcolor=BORDER, zerolinecolor=BORDER)
-    fig.update_yaxes(gridcolor=BORDER, zerolinecolor=BORDER)
-    return fig
 
 
 def build_html_report(defect_rate, avg_conf, total, report, biz) -> str:
@@ -528,22 +284,20 @@ def build_html_report(defect_rate, avg_conf, total, report, biz) -> str:
     <head>
     <meta charset="utf-8">
     <style>
-        body {{ font-family: 'Inter', Arial, sans-serif; background:{BG}; color:{TEXT_PRIMARY}; padding:32px; }}
-        h1 {{ color:{TEXT_PRIMARY}; font-weight:700; }}
-        h2 {{ color:{TEXT_PRIMARY}; border-bottom:1px solid {BORDER}; padding-bottom:6px; }}
-        table {{ border-collapse: collapse; width:100%; margin-top:12px; font-family: 'IBM Plex Mono', monospace; font-size:0.85rem; }}
-        th, td {{ border:1px solid {BORDER}; padding:8px 12px; text-align:left; }}
-        th {{ background:{PANEL}; color:{TEXT_SECONDARY}; text-transform:uppercase; font-size:0.72rem; letter-spacing:0.06em; }}
-        .metric {{ display:inline-block; background:{PANEL}; border:1px solid {BORDER}; border-left:3px solid {ACCENT};
-                   border-radius:6px; padding:14px 18px; margin-right:12px; margin-bottom:12px; }}
-        .metric .label {{ color:{TEXT_SECONDARY}; font-size:0.7rem; text-transform:uppercase; letter-spacing:0.08em;
-                           font-family:'IBM Plex Mono', monospace; }}
-        .metric .value {{ color:{TEXT_PRIMARY}; font-size:1.4rem; font-weight:700; font-family:'IBM Plex Mono', monospace; }}
+        body {{ font-family: Arial, sans-serif; background:#0b0f19; color:#e2e8f0; padding:32px; }}
+        h1 {{ color:#f1f5f9; }}
+        table {{ border-collapse: collapse; width:100%; margin-top:12px; }}
+        th, td {{ border:1px solid #1f2937; padding:8px 12px; text-align:left; }}
+        th {{ background:#111827; color:#94a3b8; text-transform:uppercase; font-size:0.75rem; }}
+        .metric {{ display:inline-block; background:#111827; border:1px solid #1f2937;
+                   border-radius:8px; padding:14px 18px; margin-right:12px; margin-bottom:12px; }}
+        .metric .label {{ color:#94a3b8; font-size:0.75rem; text-transform:uppercase; }}
+        .metric .value {{ color:#f1f5f9; font-size:1.4rem; font-weight:700; }}
     </style>
     </head>
     <body>
         <h1>Defect Vision System — Inspection Report</h1>
-        <p style="color:{TEXT_SECONDARY};">Generated: {generated_at}</p>
+        <p>Generated: {generated_at}</p>
         <div>
             <div class="metric"><div class="label">Session Inspections</div><div class="value">{total}</div></div>
             <div class="metric"><div class="label">Defect Rate (session)</div><div class="value">{defect_rate:.1%}</div></div>
@@ -568,18 +322,13 @@ def build_html_report(defect_rate, avg_conf, total, report, biz) -> str:
 # ---------------------------------------------------------------------------
 # SIDEBAR
 # ---------------------------------------------------------------------------
-raw_html(
-    f"""
-    <div class="brand-row">
-        <div class="brand-mark"></div>
-        <div>
-            <div class="brand-title">Defect Vision System</div>
-            <div class="brand-sub">Youssef Lasheen — AI &amp; ML Engineer</div>
-        </div>
-    </div>
-    <div class="sidebar-eyebrow">Modules</div>
+st.sidebar.markdown(
+    """
+    <div class="brand-title">Defect Vision System</div>
+    <div class="brand-sub">Built by Youssef Lasheen — AI &amp; ML Engineer</div>
+    <hr>
     """,
-    target=st.sidebar,
+    unsafe_allow_html=True,
 )
 
 page = st.sidebar.radio(
@@ -595,10 +344,9 @@ page = st.sidebar.radio(
         "Inspection History",
         "Business Impact",
     ],
-    label_visibility="collapsed",
 )
 
-st.sidebar.markdown('<div class="sidebar-eyebrow">Calibration</div>', unsafe_allow_html=True)
+st.sidebar.markdown("<hr>", unsafe_allow_html=True)
 threshold = st.sidebar.slider(
     "Decision threshold (defective class)", min_value=0.05, max_value=0.95, value=0.50, step=0.05
 )
@@ -610,46 +358,16 @@ st.sidebar.caption(
 )
 
 # ---------------------------------------------------------------------------
-# SYSTEM STATUS STRIP (shown above every module)
-# ---------------------------------------------------------------------------
-def render_status_strip():
-    hist_df = history_dataframe()
-    total = len(hist_df)
-    if total == 0:
-        status, color, msg = "STANDBY", TEXT_SECONDARY, "No inspections logged in this session yet"
-    else:
-        defect_rate = (hist_df["label"] == "defective").mean()
-        if defect_rate > alert_threshold:
-            status, color = "ALERT", DEFECT_COLOR
-            msg = f"Defect rate {defect_rate:.1%} exceeds the {alert_threshold:.0%} threshold"
-        else:
-            status, color = "NOMINAL", GOOD_COLOR
-            msg = f"Defect rate {defect_rate:.1%} — within threshold ({total} inspections logged)"
-    raw_html(
-        f"""
-        <div class="status-strip" style="border-color:{color}55;">
-            <span class="status-strip-led" style="background:{color};box-shadow:0 0 8px {color};"></span>
-            <span class="status-strip-label" style="color:{color};">{status}</span>
-            <span class="status-strip-msg">{msg}</span>
-            <span class="status-strip-time">{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</span>
-        </div>
-        """
-    )
-
-
-render_status_strip()
-
-# ---------------------------------------------------------------------------
 # PAGE: Overview
 # ---------------------------------------------------------------------------
 if page == "Overview":
-    page_header("Monitoring", "Operations Overview", "Live session KPIs across all inspections run in this dashboard session.")
+    st.title("Operations Overview")
+    st.caption("Live session KPIs across all inspections run in this dashboard session.")
 
     hist_df = history_dataframe()
     total = len(hist_df)
     defect_rate = (hist_df["label"] == "defective").mean() if total else 0.0
     avg_conf = hist_df["confidence"].mean() if total else 0.0
-    status_color = DEFECT_COLOR if (total and defect_rate > alert_threshold) else GOOD_COLOR
 
     if total and defect_rate > alert_threshold:
         st.markdown(
@@ -660,14 +378,13 @@ if page == "Overview":
 
     c1, c2, c3, c4 = st.columns(4)
     kpi_card("Total Inspections", f"{total}", "This session", c1)
-    kpi_card("Defect Rate", f"{defect_rate:.1%}", "Session average", c2, accent=status_color if total else None)
+    kpi_card("Defect Rate", f"{defect_rate:.1%}", "Session average", c2)
     kpi_card("Average Confidence", f"{avg_conf:.1%}" if total else "—", "All inspections", c3)
     kpi_card(
         "Status",
         "ALERT" if (total and defect_rate > alert_threshold) else "NORMAL",
         f"Threshold {alert_threshold:.0%}",
         c4,
-        accent=status_color,
     )
 
     st.markdown("###")
@@ -684,12 +401,10 @@ if page == "Overview":
             go.Indicator(
                 mode="gauge+number",
                 value=defect_rate * 100 if total else 0,
-                number={"suffix": "%", "font": {"family": FONT_MONO}},
+                number={"suffix": "%"},
                 gauge={
                     "axis": {"range": [0, 100]},
                     "bar": {"color": ACCENT},
-                    "bgcolor": PANEL,
-                    "bordercolor": BORDER,
                     "steps": [
                         {"range": [0, alert_threshold * 100], "color": "#14532d"},
                         {"range": [alert_threshold * 100, 100], "color": "#7f1d1d"},
@@ -697,19 +412,17 @@ if page == "Overview":
                 },
             )
         )
-        gauge.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10))
-        apply_chart_theme(gauge)
+        gauge.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0")
         st.plotly_chart(gauge, use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # PAGE: Live Inspector
 # ---------------------------------------------------------------------------
 elif page == "Live Inspector":
-    page_header(
-        "Inspection",
-        "Live Inspector",
+    st.title("Live Inspector")
+    st.caption(
         "Upload a product-surface photo. The CNN classifies it as good or defective "
-        "and Grad-CAM highlights exactly which pixels drove the decision.",
+        "and Grad-CAM highlights exactly which pixels drove the decision."
     )
 
     uploaded = st.file_uploader("Upload an image (PNG/JPG)", type=["png", "jpg", "jpeg"])
@@ -761,7 +474,8 @@ elif page == "Live Inspector":
 # PAGE: Batch Processing
 # ---------------------------------------------------------------------------
 elif page == "Batch Processing":
-    page_header("Inspection", "Batch Processing", "Upload multiple images to run inspection across an entire batch at once.")
+    st.title("Batch Processing")
+    st.caption("Upload multiple images to run inspection across an entire batch at once.")
 
     files = st.file_uploader(
         "Upload images (PNG/JPG)", type=["png", "jpg", "jpeg"], accept_multiple_files=True
@@ -798,7 +512,7 @@ elif page == "Batch Processing":
 
         c1, c2, c3 = st.columns(3)
         kpi_card("Batch Size", f"{len(files)}", "Images processed", c1)
-        kpi_card("Defect Rate", f"{defect_rate:.1%}", "This batch", c2, accent=DEFECT_COLOR if defect_rate > alert_threshold else GOOD_COLOR)
+        kpi_card("Defect Rate", f"{defect_rate:.1%}", "This batch", c2)
         kpi_card("Avg. Confidence", f"{batch_df['confidence'].mean():.1%}", "This batch", c3)
 
         st.subheader("Results")
@@ -817,9 +531,9 @@ elif page == "Batch Processing":
                 st.image(thumb, use_container_width=True)
                 color = DEFECT_COLOR if label == "defective" else GOOD_COLOR
                 st.markdown(
-                    f'<div style="text-align:center;color:{color};font-family:{FONT_MONO};'
-                    f'font-weight:600;font-size:0.82rem;">{label.upper()} ({conf:.0%})</div>'
-                    f'<div style="text-align:center;color:{TEXT_SECONDARY};font-size:0.72rem;">{name}</div>',
+                    f'<div style="text-align:center;color:{color};font-weight:600;">'
+                    f'{label.upper()} ({conf:.0%})</div><div style="text-align:center;'
+                    f'color:#64748b;font-size:0.75rem;">{name}</div>',
                     unsafe_allow_html=True,
                 )
     else:
@@ -829,11 +543,10 @@ elif page == "Batch Processing":
 # PAGE: Video Analysis
 # ---------------------------------------------------------------------------
 elif page == "Video Analysis":
-    page_header(
-        "Inspection",
-        "Video Analysis",
+    st.title("Video Analysis")
+    st.caption(
         "Upload a video of the production line. Frames are sampled at a fixed interval, "
-        "each frame is run through the model, and results are plotted as a timeline.",
+        "each frame is run through the model, and results are plotted as a timeline."
     )
 
     if not CV2_AVAILABLE:
@@ -907,7 +620,7 @@ elif page == "Video Analysis":
 
                 c1, c2, c3 = st.columns(3)
                 kpi_card("Frames Analyzed", f"{len(video_df)}", f"Every {sample_interval}s", c1)
-                kpi_card("Defect Rate", f"{defect_rate:.1%}", "Across sampled frames", c2, accent=DEFECT_COLOR if defect_rate > alert_threshold else GOOD_COLOR)
+                kpi_card("Defect Rate", f"{defect_rate:.1%}", "Across sampled frames", c2)
                 kpi_card("Flagged Frames", f"{len(flagged_frames)}", "Defective detections", c3)
 
                 st.subheader("Defect Timeline")
@@ -919,12 +632,17 @@ elif page == "Video Analysis":
                         y=video_df["confidence"],
                         mode="markers+lines",
                         marker=dict(color=colors, size=9),
-                        line=dict(color=BORDER),
+                        line=dict(color="#334155"),
                         name="Confidence",
                     )
                 )
-                timeline.update_layout(xaxis_title="Time (seconds)", yaxis_title="Confidence")
-                apply_chart_theme(timeline)
+                timeline.update_layout(
+                    xaxis_title="Time (seconds)",
+                    yaxis_title="Confidence",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font_color="#e2e8f0",
+                )
                 st.plotly_chart(timeline, use_container_width=True)
 
                 if flagged_frames:
@@ -934,8 +652,8 @@ elif page == "Video Analysis":
                         with grid_cols[i % 4]:
                             st.image(thumb, use_container_width=True)
                             st.markdown(
-                                f'<div style="text-align:center;color:{DEFECT_COLOR};'
-                                f'font-family:{FONT_MONO};font-size:0.75rem;">t = {ts:.1f}s ({conf:.0%})</div>',
+                                f'<div style="text-align:center;color:{DEFECT_COLOR};font-size:0.8rem;">'
+                                f't = {ts:.1f}s ({conf:.0%})</div>',
                                 unsafe_allow_html=True,
                             )
 
@@ -953,7 +671,7 @@ elif page == "Video Analysis":
 # PAGE: Model Performance
 # ---------------------------------------------------------------------------
 elif page == "Model Performance":
-    page_header("Analytics", "Model Performance", "Training curves and test-set diagnostics for the current model.")
+    st.title("Model Performance")
 
     history = load_training_history()
     report = load_classification_report()
@@ -962,17 +680,21 @@ elif page == "Model Performance":
         col1, col2 = st.columns(2)
         with col1:
             fig = go.Figure()
-            fig.add_trace(go.Scatter(y=history["accuracy"], name="Train accuracy", line=dict(color=ACCENT)))
-            fig.add_trace(go.Scatter(y=history["val_accuracy"], name="Val accuracy", line=dict(color=GOOD_COLOR)))
-            fig.update_layout(title="Accuracy over training", xaxis_title="Epoch", yaxis_title="Accuracy")
-            apply_chart_theme(fig)
+            fig.add_trace(go.Scatter(y=history["accuracy"], name="Train accuracy"))
+            fig.add_trace(go.Scatter(y=history["val_accuracy"], name="Val accuracy"))
+            fig.update_layout(
+                title="Accuracy over training", xaxis_title="Epoch", yaxis_title="Accuracy",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+            )
             st.plotly_chart(fig, use_container_width=True)
         with col2:
             fig = go.Figure()
-            fig.add_trace(go.Scatter(y=history["loss"], name="Train loss", line=dict(color=ACCENT)))
-            fig.add_trace(go.Scatter(y=history["val_loss"], name="Val loss", line=dict(color=WARN_COLOR)))
-            fig.update_layout(title="Loss over training", xaxis_title="Epoch", yaxis_title="Loss")
-            apply_chart_theme(fig)
+            fig.add_trace(go.Scatter(y=history["loss"], name="Train loss"))
+            fig.add_trace(go.Scatter(y=history["val_loss"], name="Val loss"))
+            fig.update_layout(
+                title="Loss over training", xaxis_title="Epoch", yaxis_title="Loss",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     if report:
@@ -1007,7 +729,7 @@ elif page == "Model Performance":
 # PAGE: ROC / PR Analysis
 # ---------------------------------------------------------------------------
 elif page == "ROC / PR Analysis":
-    page_header("Analytics", "ROC / Precision-Recall Analysis", "Threshold-independent diagnostics for the defective class.")
+    st.title("ROC / Precision-Recall Analysis")
 
     if not SKLEARN_AVAILABLE:
         st.warning("This page requires scikit-learn. Add `scikit-learn` to requirements.txt and redeploy.")
@@ -1040,15 +762,19 @@ elif page == "ROC / PR Analysis":
             with col1:
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=fpr, y=tpr, name=f"ROC (AUC = {roc_auc:.3f})", line=dict(color=ACCENT)))
-                fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], name="Random baseline", line=dict(dash="dash", color=TEXT_SECONDARY)))
-                fig.update_layout(title="ROC Curve", xaxis_title="False Positive Rate", yaxis_title="True Positive Rate")
-                apply_chart_theme(fig)
+                fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], name="Random baseline", line=dict(dash="dash", color="#475569")))
+                fig.update_layout(
+                    title="ROC Curve", xaxis_title="False Positive Rate", yaxis_title="True Positive Rate",
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+                )
                 st.plotly_chart(fig, use_container_width=True)
             with col2:
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=recall, y=precision, name="Precision-Recall", line=dict(color=ACCENT)))
-                fig.update_layout(title="Precision-Recall Curve", xaxis_title="Recall", yaxis_title="Precision")
-                apply_chart_theme(fig)
+                fig.update_layout(
+                    title="Precision-Recall Curve", xaxis_title="Recall", yaxis_title="Precision",
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+                )
                 st.plotly_chart(fig, use_container_width=True)
 
             st.metric("ROC AUC", f"{roc_auc:.4f}")
@@ -1057,7 +783,8 @@ elif page == "ROC / PR Analysis":
 # PAGE: ROI Calculator
 # ---------------------------------------------------------------------------
 elif page == "ROI Calculator":
-    page_header("Analytics", "ROI Calculator", "Model estimates prefill from the test-set classification report where available.")
+    st.title("ROI Calculator")
+    st.caption("Model estimates prefill from the test-set classification report where available.")
 
     report = load_classification_report()
     biz = config["business"]
@@ -1106,12 +833,14 @@ elif page == "ROI Calculator":
     st.subheader("Cost Comparison")
     fig = go.Figure(
         data=[
-            go.Bar(name="Manual Inspection", x=["Daily Cost"], y=[manual_daily_cost], marker_color=TEXT_SECONDARY),
+            go.Bar(name="Manual Inspection", x=["Daily Cost"], y=[manual_daily_cost], marker_color="#64748b"),
             go.Bar(name="Model-Assisted", x=["Daily Cost"], y=[model_daily_cost], marker_color=ACCENT),
         ]
     )
-    fig.update_layout(barmode="group", yaxis_title="Estimated cost ($)")
-    apply_chart_theme(fig)
+    fig.update_layout(
+        barmode="group", yaxis_title="Estimated cost ($)",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
     st.caption(
@@ -1123,7 +852,8 @@ elif page == "ROI Calculator":
 # PAGE: Inspection History
 # ---------------------------------------------------------------------------
 elif page == "Inspection History":
-    page_header("Monitoring", "Inspection History", "All inspections run in this browser session (Live Inspector, Batch Processing, Video Analysis).")
+    st.title("Inspection History")
+    st.caption("All inspections run in this browser session (Live Inspector, Batch Processing, Video Analysis).")
 
     hist_df = history_dataframe()
 
@@ -1156,15 +886,17 @@ elif page == "Inspection History":
             hist_df["rolling_rate"] = hist_df["is_defective"].expanding().mean()
             fig = go.Figure()
             fig.add_trace(go.Scatter(y=hist_df["rolling_rate"], mode="lines", line=dict(color=ACCENT)))
-            fig.update_layout(xaxis_title="Inspection #", yaxis_title="Cumulative defect rate")
-            apply_chart_theme(fig)
+            fig.update_layout(
+                xaxis_title="Inspection #", yaxis_title="Cumulative defect rate",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+            )
             st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # PAGE: Business Impact
 # ---------------------------------------------------------------------------
 elif page == "Business Impact":
-    page_header("Analytics", "Business Impact", "Cost model, evaluation artifacts, and exportable reporting.")
+    st.title("Business Impact")
 
     summary_path = ROOT / "reports" / "summary.md"
     if summary_path.exists():
