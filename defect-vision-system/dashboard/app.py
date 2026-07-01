@@ -440,11 +440,18 @@ elif page == "Live Inspector":
     if uploaded is not None:
         img = Image.open(uploaded).convert("RGB")
     elif use_sample is not None:
-        sample_dir = ROOT / "data" / "processed" / "test" / use_sample
+        # Prefer the committed demo samples (always present in the repo);
+        # fall back to the generated test split if it exists locally.
+        sample_dir = ROOT / "dashboard" / "assets" / "samples" / use_sample
         sample_files = sorted(sample_dir.glob("*.png"))
+        if not sample_files:
+            sample_dir = ROOT / "data" / "processed" / "test" / use_sample
+            sample_files = sorted(sample_dir.glob("*.png"))
         if sample_files:
             idx = np.random.randint(0, len(sample_files))
             img = Image.open(sample_files[idx]).convert("RGB")
+        else:
+            st.warning("No sample images found for this class.")
 
     if img is not None:
         result = run_inference(img, threshold=threshold)
@@ -896,6 +903,17 @@ elif page == "Business Impact":
         st.markdown(summary_path.read_text())
     else:
         st.info("Run `python src/models/evaluate_model.py` first to generate the business summary.")
+
+    figures_dir = ROOT / "reports" / "figures"
+    fig_col1, fig_col2 = st.columns(2)
+    with fig_col1:
+        gradcam_path = figures_dir / "gradcam_samples.png"
+        if gradcam_path.exists():
+            st.image(str(gradcam_path), caption="Grad-CAM samples", use_container_width=True)
+    with fig_col2:
+        cm_path = figures_dir / "confusion_matrix.png"
+        if cm_path.exists():
+            st.image(str(cm_path), caption="Confusion matrix", use_container_width=True)
 
     biz = config["business"]
     st.subheader("Cost Assumptions")
